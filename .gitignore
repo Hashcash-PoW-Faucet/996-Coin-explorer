@@ -1,0 +1,26 @@
+# Secrets / local config
+.env
+
+# Python virtual environment
+.venv/
+venv/
+
+# SQLite explorer database
+explorer_index.db
+explorer_index.db-shm
+explorer_index.db-wal
+
+# Generic SQLite files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs
+*.log
