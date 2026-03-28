@@ -4,6 +4,7 @@
 # Python virtual environment
 .venv/
 venv/
+.idea/
 
 # SQLite explorer database
 explorer_index.db
