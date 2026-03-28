@@ -51,7 +51,7 @@ NNS_RPC_PASSWORD=<rpcpassword>
 NNS_RPC_HOST=127.0.0.1
 NNS_RPC_PORT=41683
 
-EXPLORER_INDEX_DB=/home/bpsexplorer/996coin-explorer/explorer_index.db
+EXPLORER_INDEX_DB=/home//<user>/996coin-explorer/explorer_index.db
 
 EXPLORER_RPC_TIMEOUT=20
 EXPLORER_REORG_CHECK_DEPTH=20
