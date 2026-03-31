@@ -1181,6 +1181,39 @@ def api_peers():
     return jsonify(peers)
 
 
+@app.route("/api/stats")
+def api_stats():
+    """
+    Public stats endpoint combining supply and selected explorer index statistics.
+    """
+    blockchaininfo = rpc_request("getblockchaininfo")
+    richlist = index_get_top_wallets(limit=1, offset=0)
+
+    wallet_count = None
+    if richlist is not None:
+        wallet_count = richlist.get("wallet_count")
+
+    return jsonify({
+        "coin": "996-Coin",
+        "symbol": "NNS",
+        "network": blockchaininfo.get("chain", "main"),
+        "circulating_supply": int(blockchaininfo.get("moneysupply") or 0),
+        "block_height": blockchaininfo.get("blocks"),
+        "bestblockhash": blockchaininfo.get("bestblockhash"),
+        "timestamp": blockchaininfo.get("mediantime"),
+        "wallet_count": wallet_count,
+        "source": "getblockchaininfo.moneysupply",
+    })
+
+
+@app.route("/api/supply")
+def api_supply():
+    blockchaininfo = rpc_request("getblockchaininfo")
+    return jsonify({
+        "circulating_supply": int(blockchaininfo.get("moneysupply") or 0)
+    })
+
+
 @app.route("/search")
 def search():
     """
