@@ -862,6 +862,41 @@ def index_get_top_wallets(limit=100, offset=0):
         conn.close()
 
 
+# --- Helper: get address balance from index UTXO set ---
+
+def index_get_address_balance(address):
+    """
+    Return the current indexed balance for a single address, based on unspent outputs.
+    """
+    conn = index_db_connect()
+    try:
+        table_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tx_outputs'"
+        ).fetchone()
+        if not table_exists:
+            return None
+
+        row = conn.execute(
+            """
+            SELECT
+                COALESCE(ROUND(SUM(value), 8), 0) AS balance,
+                COUNT(*) AS utxo_count
+            FROM tx_outputs
+            WHERE spent_by_txid IS NULL
+              AND address = ?
+            """,
+            (address,),
+        ).fetchone()
+
+        return {
+            "address": address,
+            "balance": round(float(row["balance"] or 0), 8),
+            "utxo_count": int(row["utxo_count"] or 0),
+        }
+    finally:
+        conn.close()
+
+
 def render_page(content_html, error=None, tip_height=None, **ctx):
     """
     Render the inner content template first (with its own context),
@@ -1204,6 +1239,23 @@ def api_stats():
         "wallet_count": wallet_count,
         "source": "getblockchaininfo.moneysupply",
     })
+
+
+# --- API: getbalance for address (from index) ---
+
+@app.route("/api/getbalance/<address>")
+def api_getbalance(address):
+    """
+    Public address balance endpoint based on the local explorer index.
+    Returns the current balance derived from unspent outputs.
+    """
+    balance_info = index_get_address_balance(address)
+    if balance_info is None:
+        return jsonify({
+            "error": "Explorer index database not available"
+        }), 503
+
+    return jsonify(balance_info)
 
 
 @app.route("/api/supply")
