@@ -2,20 +2,85 @@ import math
 import os
 import sqlite3
 import requests
-from flask import Flask, request, redirect, url_for, render_template_string, jsonify
+from flask import Flask, request, redirect, url_for, render_template_string, jsonify, make_response
 from datetime import datetime
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
 
+
+def _is_public_get_api_path(path):
+    """
+    Return True for public GET-based JSON API endpoints that should be callable
+    cross-origin from browser wallets.
+    """
+    if not isinstance(path, str):
+        return False
+
+    prefixes = (
+        "/api/getbalance/",
+        "/api/utxos/",
+        "/api/address/",
+        "/api/txstatus/",
+        "/api/peers",
+        "/api/stats",
+        "/api/supply",
+    )
+    return path.startswith(prefixes)
+
+
+def _is_public_post_api_path(path):
+    """
+    Return True for transaction-related API endpoints that browser wallets may
+    call cross-origin via POST.
+    """
+    if not isinstance(path, str):
+        return False
+
+    return path in (
+        "/api/testmempoolaccept",
+        "/api/sendrawtransaction",
+    )
+
+
+@app.after_request
+def add_public_get_api_cors_headers(response):
+    """
+    Add CORS headers for browser-wallet API access.
+    - Public GET endpoints are readable cross-origin.
+    - Selected POST transaction endpoints are callable cross-origin.
+    """
+    try:
+        if request.method == "GET" and _is_public_get_api_path(request.path):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        elif request.method == "POST" and _is_public_post_api_path(request.path):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+    except Exception:
+        pass
+    return response
+
 # --- 996-Coin RPC configuration ---
 RPC_USER = os.environ.get("NNS_RPC_USER", "test")
 RPC_PASSWORD = os.environ.get("NNS_RPC_PASSWORD", "test")
 RPC_HOST = os.environ.get("NNS_RPC_HOST", "127.0.0.1")
 RPC_PORT = os.environ.get("NNS_RPC_PORT", "41683")
+
 EXPLORER_INDEX_DB = os.environ.get("EXPLORER_INDEX_DB", "explorer_index.db")
+TX_API_KEY = os.environ.get("EXPLORER_TX_API_KEY", "")
+
+SENDRAWTX_MAX_HEX_LEN = int(os.environ.get("SENDRAWTX_MAX_HEX_LEN", "200000"))
+SENDRAWTX_RATE_LIMIT_WINDOW_SEC = int(os.environ.get("SENDRAWTX_RATE_LIMIT_WINDOW_SEC", "60"))
+SENDRAWTX_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SENDRAWTX_RATE_LIMIT_MAX_REQUESTS", "10"))
+
+# If the service grows, this can later move to Redis or a reverse-proxy rate limit.
+_SENDRAWTX_RATE_STATE = {}
 
 
 def rpc_request(method, params=None):
@@ -136,6 +201,62 @@ def public_error_message(exc, fallback="Request failed."):
     if app.debug:
         return str(exc)
     return fallback
+
+
+def require_tx_api_key():
+    """
+    Best-effort protection for raw transaction broadcast.
+    If EXPLORER_TX_API_KEY is set, require the caller to provide it either as
+    X-API-Key header or as JSON field `api_key`.
+    """
+    if not TX_API_KEY:
+        return None
+
+    header_key = (request.headers.get("X-API-Key") or "").strip()
+    body = request.get_json(silent=True) or {}
+    body_key = str(body.get("api_key") or "").strip()
+
+    if header_key == TX_API_KEY or body_key == TX_API_KEY:
+        return None
+
+    return jsonify({"error": "unauthorized"}), 401
+
+
+def get_client_ip():
+    """
+    Best-effort client IP detection.
+    Prefer the first X-Forwarded-For hop when the app is behind a reverse proxy.
+    """
+    xff = (request.headers.get("X-Forwarded-For") or "").strip()
+    if xff:
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    return (request.remote_addr or "unknown").strip() or "unknown"
+
+
+def sendrawtx_rate_limit_check(client_ip):
+    """
+    Small in-memory sliding-window rate limit for the sendrawtransaction API.
+    Returns None when allowed, or a Flask response tuple when blocked.
+    """
+    now = time.time()
+    window_start = now - SENDRAWTX_RATE_LIMIT_WINDOW_SEC
+
+    recent = _SENDRAWTX_RATE_STATE.get(client_ip, [])
+    recent = [ts for ts in recent if ts >= window_start]
+
+    if len(recent) >= SENDRAWTX_RATE_LIMIT_MAX_REQUESTS:
+        retry_after = max(1, int(recent[0] + SENDRAWTX_RATE_LIMIT_WINDOW_SEC - now))
+        return jsonify({
+            "ok": False,
+            "error": "rate limit exceeded",
+            "retry_after": retry_after,
+        }), 429
+
+    recent.append(now)
+    _SENDRAWTX_RATE_STATE[client_ip] = recent
+    return None
 
 
 BASE_TEMPLATE = """
@@ -864,6 +985,7 @@ def index_get_top_wallets(limit=100, offset=0):
 
 # --- Helper: get address balance from index UTXO set ---
 
+
 def index_get_address_balance(address):
     """
     Return the current indexed balance for a single address, based on unspent outputs.
@@ -895,6 +1017,170 @@ def index_get_address_balance(address):
         }
     finally:
         conn.close()
+
+
+# --- Wallet helper: get address UTXOs from index ---
+def index_get_address_utxos(address, tip_height=None):
+    """
+    Return current unspent outputs for a single address from the local explorer index.
+    """
+    conn = index_db_connect()
+    try:
+        table_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tx_outputs'"
+        ).fetchone()
+        if not table_exists:
+            return None
+
+        rows = conn.execute(
+            """
+            SELECT
+                txid,
+                vout,
+                value,
+                script_type,
+                script_hex,
+                block_height,
+                block_time
+            FROM tx_outputs
+            WHERE spent_by_txid IS NULL
+              AND address = ?
+            ORDER BY value DESC, block_height DESC, txid ASC, vout ASC
+            """,
+            (address,),
+        ).fetchall()
+
+        utxos = []
+        for row in rows:
+            block_height = row["block_height"]
+            confirmations = None
+            if isinstance(tip_height, int) and isinstance(block_height, int):
+                confirmations = max(0, tip_height - block_height + 1)
+
+            utxos.append({
+                "txid": row["txid"],
+                "vout": int(row["vout"]),
+                "amount": round(float(row["value"] or 0), 8),
+                "script_type": row["script_type"] or "unknown",
+                "script_hex": row["script_hex"] or "",
+                "block_height": block_height,
+                "block_time": row["block_time"],
+                "time": format_local_time(row["block_time"]),
+                "confirmations": confirmations,
+            })
+
+        return {
+            "address": address,
+            "utxos": utxos,
+            "utxo_count": len(utxos),
+            "balance": round(sum(u["amount"] for u in utxos), 8),
+        }
+    finally:
+        conn.close()
+
+
+def rpc_get_address_utxos(address, tip_height=None):
+    """
+    Return current UTXOs for one address using the node's authoritative UTXO set
+    via scantxoutset, instead of relying on the local explorer index.
+    """
+    result = rpc_request("scantxoutset", ["start", [f"addr({address})"]])
+    unspents = result.get("unspents") if isinstance(result, dict) else None
+    if not isinstance(unspents, list):
+        return {
+            "address": address,
+            "utxos": [],
+            "utxo_count": 0,
+            "balance": 0.0,
+        }
+
+    utxos = []
+    total_balance = 0.0
+
+    for utxo in unspents:
+        amount = round(float(utxo.get("amount") or 0), 8)
+        height = utxo.get("height")
+        confirmations = None
+        if isinstance(tip_height, int) and isinstance(height, int):
+            confirmations = max(0, tip_height - height + 1)
+
+        script_hex = str(utxo.get("scriptPubKey") or "").strip()
+
+        utxos.append({
+            "txid": utxo.get("txid"),
+            "vout": int(utxo.get("vout") or 0),
+            "outputIndex": int(utxo.get("vout") or 0),
+            "amount": amount,
+            "satoshis": int(round(amount * 100000000)),
+            "scriptPubKey": script_hex,
+            "script": script_hex,
+            "script_hex": script_hex,
+            "script_type": "unknown",
+            "block_height": height,
+            "height": height,
+            "confirmations": confirmations,
+            "address": address,
+        })
+        total_balance += amount
+
+    utxos.sort(key=lambda u: (-u["amount"], -(u["height"] or 0), u["txid"], u["vout"]))
+
+    return {
+        "address": address,
+        "utxos": utxos,
+        "utxo_count": len(utxos),
+        "balance": round(total_balance, 8),
+        "success": bool(result.get("success")) if isinstance(result, dict) else True,
+        "method": "scantxoutset",
+    }
+
+
+@app.route("/api/utxos/<address>")
+def api_utxos(address):
+    """
+    Public address UTXO endpoint for potential light wallets.
+    Uses scantxoutset directly so the wallet sees the node's authoritative UTXO set.
+    """
+    try:
+        tip_height = rpc_request("getblockcount")
+        data = rpc_get_address_utxos(address, tip_height=tip_height)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": public_error_message(e, "Failed to load UTXOs.")}), 400
+
+
+def tx_status(txid):
+    """
+    Return a compact transaction status summary for wallet polling.
+    """
+    tx = rpc_request("getrawtransaction", [txid, 1])
+    tx = enrich_transaction(tx)
+    blockhash = tx.get("blockhash")
+    block_height = None
+    block_time = None
+    if blockhash:
+        try:
+            blk = rpc_request("getblock", [blockhash])
+            block_height = blk.get("height")
+            block_time = blk.get("time")
+        except Exception:
+            block_height = None
+            block_time = None
+
+    return {
+        "txid": txid,
+        "confirmations": tx.get("confirmations", 0),
+        "in_mempool": blockhash in (None, ""),
+        "blockhash": blockhash,
+        "block_height": block_height,
+        "block_time": block_time,
+        "time": format_local_time(block_time) if block_time is not None else None,
+        "tx_type": tx.get("explorer_type", "unknown"),
+        "input_total": tx.get("explorer_input_total"),
+        "output_total": tx.get("explorer_output_total"),
+        "fee": tx.get("explorer_fee"),
+        "reward": tx.get("explorer_reward"),
+    }
 
 
 def render_page(content_html, error=None, tip_height=None, **ctx):
@@ -1243,6 +1529,7 @@ def api_stats():
 
 # --- API: getbalance for address (from index) ---
 
+
 @app.route("/api/getbalance/<address>")
 def api_getbalance(address):
     """
@@ -1258,12 +1545,219 @@ def api_getbalance(address):
     return jsonify(balance_info)
 
 
+# --- Light-wallet address history JSON API endpoint ---
+@app.route("/api/address/<address>/history")
+def api_address_history(address):
+    """
+    Public address history endpoint based on the local explorer index.
+    Supports pagination via `page` and `limit` query params.
+    """
+    page = request.args.get("page", default=1, type=int)
+    limit = request.args.get("limit", default=50, type=int)
+
+    if page is None or page < 1:
+        page = 1
+    if limit is None or limit < 1:
+        limit = 50
+    limit = min(limit, 200)
+    offset = (page - 1) * limit
+
+    try:
+        tip_height = rpc_request("getblockcount")
+        summary = index_get_address_summary(address, tip_height=tip_height, limit=limit, offset=offset)
+        if summary is None:
+            return jsonify({"error": "Explorer index database not available"}), 503
+
+        return jsonify({
+            "address": address,
+            "page": page,
+            "limit": limit,
+            "received_total": summary["received_total"],
+            "sent_total": summary["sent_total"],
+            "balance_delta": summary["balance_delta"],
+            "entry_count": summary["entry_count"],
+            "tx_count": summary["tx_count"],
+            "history": summary["tx_rows"],
+        })
+    except Exception as e:
+        return jsonify({"error": public_error_message(e, "Failed to load address history.")}), 400
+
+
+# --- API: sendrawtransaction endpoint ---
+
+
+
+
+@app.route("/api/sendrawtransaction", methods=["POST"])
+def api_sendrawtransaction():
+    """
+    Broadcast a raw transaction hex through the local node.
+    Expected JSON body:
+      {"hex": "..."}
+    If EXPLORER_TX_API_KEY is set, the caller must also provide it either as
+    X-API-Key header or as JSON field `api_key`.
+    """
+    auth_error = require_tx_api_key()
+    if auth_error is not None:
+        return auth_error
+
+    if not request.is_json:
+        return jsonify({
+            "ok": False,
+            "error": "content type must be application/json",
+        }), 415
+
+    client_ip = get_client_ip()
+    rate_error = sendrawtx_rate_limit_check(client_ip)
+    if rate_error is not None:
+        return rate_error
+
+    data = request.get_json(silent=True) or {}
+    raw_hex = str(data.get("hex") or "").strip()
+
+    if request.content_length is not None and request.content_length > (SENDRAWTX_MAX_HEX_LEN + 4096):
+        return jsonify({"error": "request too large"}), 413
+
+    if len(raw_hex) == 0:
+        return jsonify({"error": "missing raw transaction hex"}), 400
+
+    if len(raw_hex) > SENDRAWTX_MAX_HEX_LEN:
+        return jsonify({"error": "raw transaction hex too large"}), 400
+
+    if len(raw_hex) % 2 != 0:
+        return jsonify({"error": "raw transaction hex must have even length"}), 400
+
+    try:
+        int(raw_hex, 16)
+    except Exception:
+        return jsonify({"error": "raw transaction hex is not valid hexadecimal"}), 400
+
+    try:
+        txid = rpc_request("sendrawtransaction", [raw_hex])
+        return jsonify({
+            "ok": True,
+            "txid": txid,
+            "client_ip": client_ip,
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": public_error_message(e, "Broadcast failed."),
+        }), 400
+
+
+# --- Light-wallet testmempoolaccept JSON API endpoint ---
+
+
+@app.route("/api/testmempoolaccept", methods=["POST"])
+def api_testmempoolaccept():
+    """
+    Validate a raw transaction against mempool policy without broadcasting it.
+    Expected JSON body:
+      {"hex": "..."}
+    If EXPLORER_TX_API_KEY is set, the caller must also provide it either as
+    X-API-Key header or as JSON field `api_key`.
+    """
+    auth_error = require_tx_api_key()
+    if auth_error is not None:
+        return auth_error
+
+    if not request.is_json:
+        return jsonify({
+            "ok": False,
+            "error": "content type must be application/json",
+        }), 415
+
+    client_ip = get_client_ip()
+    rate_error = sendrawtx_rate_limit_check(client_ip)
+    if rate_error is not None:
+        return rate_error
+
+    data = request.get_json(silent=True) or {}
+    raw_hex = str(data.get("hex") or "").strip()
+
+    if request.content_length is not None and request.content_length > (SENDRAWTX_MAX_HEX_LEN + 4096):
+        return jsonify({"error": "request too large"}), 413
+
+    if len(raw_hex) == 0:
+        return jsonify({"error": "missing raw transaction hex"}), 400
+
+    if len(raw_hex) > SENDRAWTX_MAX_HEX_LEN:
+        return jsonify({"error": "raw transaction hex too large"}), 400
+
+    if len(raw_hex) % 2 != 0:
+        return jsonify({"error": "raw transaction hex must have even length"}), 400
+
+    try:
+        int(raw_hex, 16)
+    except Exception:
+        return jsonify({"error": "raw transaction hex is not valid hexadecimal"}), 400
+
+    try:
+        result = rpc_request("testmempoolaccept", [[raw_hex]])
+        if isinstance(result, list) and result:
+            entry = result[0]
+            return jsonify({
+                "ok": True,
+                "client_ip": client_ip,
+                "result": entry,
+            })
+
+        return jsonify({
+            "ok": False,
+            "client_ip": client_ip,
+            "error": "unexpected testmempoolaccept response",
+        }), 400
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": public_error_message(e, "Mempool test failed."),
+        }), 400
+
+
+# --- Light-wallet transaction status JSON API endpoint ---
+@app.route("/api/txstatus/<txid>")
+def api_txstatus(txid):
+    """
+    Compact transaction status endpoint for wallet polling.
+    """
+    try:
+        return jsonify(tx_status(txid))
+    except Exception as e:
+        return jsonify({"error": public_error_message(e, "Failed to load transaction status.")}), 400
+
+
 @app.route("/api/supply")
 def api_supply():
     blockchaininfo = rpc_request("getblockchaininfo")
     return jsonify({
         "circulating_supply": int(blockchaininfo.get("moneysupply") or 0)
     })
+
+
+
+# Minimal CORS preflight support for browser-based wallets and web apps.
+@app.route("/api/<path:subpath>", methods=["OPTIONS"])
+def api_options(subpath):
+    """
+    Minimal CORS preflight support for browser-based wallets and web apps.
+    """
+    full_path = f"/api/{subpath}"
+    if _is_public_get_api_path(full_path):
+        response = make_response("", 204)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return response
+
+    if _is_public_post_api_path(full_path):
+        response = make_response("", 204)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+        return response
+
+    return make_response("", 404)
 
 
 @app.route("/search")
